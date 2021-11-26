@@ -666,6 +666,175 @@ class SpeechCommands(SequenceDataset):
 
 """ LRA datasets """
 
+
+class SQUADC(SequenceDataset):
+    _name_ = "squadc"
+    _torch_name_ = "squad_v2"
+    d_output = 2
+    l_output = 0
+
+    @property
+    def init_defaults(self):
+        return {
+            "l_max": 4096,
+            "level": "char",
+            "min_freq": 15,
+            "seed": 42,
+            "val_split": 0.0,
+            "append_bos": False,
+            "append_eos": True,
+            # 'max_vocab': 135,
+            "n_workers": 4,  # Only used for tokenizing dataset before caching
+        }
+
+    @property
+    def n_tokens(self):
+        return len(self.vocab)
+
+    def init(self):
+        """If cache_dir is not None, we'll cache the processed dataset there."""
+        self.data_dir = self.data_dir or default_data_path / self._name_
+        self.cache_dir = self.data_dir / "cache"
+        assert self.level in [
+            "word",
+            "char",
+        ], f"level {self.level} not supported"
+
+    def prepare_data(self):
+        if self.cache_dir is None:  # Just download the dataset
+            load_dataset(self._torch_name_, cache_dir=self.data_dir)
+        else:  # Process the dataset and save it
+            self.process_dataset()
+
+    def setup(self, stage=None):
+        if stage == "test" and hasattr(self, "dataset_test"):
+            return
+        dataset, self.tokenizer, self.vocab = self.process_dataset()
+        print(
+            f"SQuAD2 {self.level} level | min_freq {self.min_freq} | vocab size {len(self.vocab)}"
+        )
+        dataset.set_format(type="torch", columns=["input_ids", "label"])
+
+        # Create all splits
+        dataset_train, self.dataset_test = dataset["train"], dataset["test"]
+        if self.val_split == 0.0:
+            # Use test set as val set, as done in the LRA paper
+            self.dataset_train, self.dataset_val = dataset_train, None
+        else:
+            train_val = dataset_train.train_test_split(
+                test_size=self.val_split, seed=self.seed
+            )
+            self.dataset_train, self.dataset_val = (
+                train_val["train"],
+                train_val["test"],
+            )
+
+        def collate_batch(batch, resolution=1):
+            xs, ys = zip(*[(data["input_ids"], data["label"]) for data in batch])
+            lengths = torch.tensor([len(x) for x in xs])
+            xs = nn.utils.rnn.pad_sequence(
+                xs, padding_value=self.vocab["<pad>"], batch_first=True
+            )
+            ys = torch.tensor(ys)
+            return xs, ys, lengths
+
+        self.collate_fn = collate_batch
+
+    def process_dataset(self):
+        cache_dir = (
+            None if self.cache_dir is None else self.cache_dir / self._cache_dir_name
+        )
+        if cache_dir is not None:
+            if cache_dir.is_dir():
+                return self._load_from_cache(cache_dir)
+
+        dataset = load_dataset(self._torch_name_, cache_dir=self.data_dir)
+        dataset = DatasetDict(train=dataset["train"], test=dataset["validation"])
+        if self.level == "word":
+            tokenizer = torchtext.data.utils.get_tokenizer(
+                "spacy", language="en_core_web_sm"
+            )
+        else:  # self.level == 'char'
+            tokenizer = list  # Just convert a string to a list of chars
+        # Account for <bos> and <eos> tokens
+        l_max = self.l_max - int(self.append_bos) - int(self.append_eos)
+        #tokenize = lambda example: {"tokens": tokenizer(example["text"])[:l_max]}
+
+        def tokenize(example):
+            label=0
+            if 'answers' in example:
+                if len(example['answers']['text']) > 0:
+                    label=1
+            
+            ret_dict = { "tokens": tokenizer('context: ' + example["context"] + '\nquestion: ' + example['question'])[:l_max],
+            "label": label}
+
+            return(ret_dict)
+
+        dataset = dataset.map(
+            tokenize,
+            remove_columns=['id','title','context','question','answers'],
+            keep_in_memory=True,
+            load_from_cache_file=False,
+            num_proc=max(self.n_workers, 1),
+        )
+        vocab = torchtext.vocab.build_vocab_from_iterator(
+            dataset["train"]["tokens"],
+            min_freq=self.min_freq,
+            specials=(
+                ["<pad>", "<unk>"]
+                + (["<bos>"] if self.append_bos else [])
+                + (["<eos>"] if self.append_eos else [])
+            ),
+        )
+        vocab.set_default_index(vocab["<unk>"])
+
+        numericalize = lambda example: {
+            "input_ids": vocab(
+                (["<bos>"] if self.append_bos else [])
+                + example["tokens"]
+                + (["<eos>"] if self.append_eos else [])
+            )
+        }
+        dataset = dataset.map(
+            numericalize,
+            remove_columns=["tokens"],
+            keep_in_memory=True,
+            load_from_cache_file=False,
+            num_proc=max(self.n_workers, 1),
+        )
+
+        if cache_dir is not None:
+            self._save_to_cache(dataset, tokenizer, vocab, cache_dir)
+        return dataset, tokenizer, vocab
+
+    def _save_to_cache(self, dataset, tokenizer, vocab, cache_dir):
+        cache_dir = self.cache_dir / self._cache_dir_name
+        logger = logging.getLogger(__name__)
+        logger.info(f"Saving to cache at {str(cache_dir)}")
+        dataset.save_to_disk(str(cache_dir))
+        with open(cache_dir / "tokenizer.pkl", "wb") as f:
+            pickle.dump(tokenizer, f)
+        with open(cache_dir / "vocab.pkl", "wb") as f:
+            pickle.dump(vocab, f)
+
+    def _load_from_cache(self, cache_dir):
+        assert cache_dir.is_dir()
+        logger = logging.getLogger(__name__)
+        logger.info(f"Load from cache at {str(cache_dir)}")
+        dataset = DatasetDict.load_from_disk(str(cache_dir))
+        with open(cache_dir / "tokenizer.pkl", "rb") as f:
+            tokenizer = pickle.load(f)
+        with open(cache_dir / "vocab.pkl", "rb") as f:
+            vocab = pickle.load(f)
+        return dataset, tokenizer, vocab
+
+    @property
+    def _cache_dir_name(self):
+        return f"l_max-{self.l_max}-level-{self.level}-min_freq-{self.min_freq}-append_bos-{self.append_bos}-append_eos-{self.append_eos}"
+
+
+
 class IMDB(SequenceDataset):
     _name_ = "imdb"
     d_output = 2
