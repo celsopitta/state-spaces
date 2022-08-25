@@ -1,11 +1,7 @@
-""" Implementations of several types of Discrete Sin/Cosine Transforms with various reductions to FFT. """
+"""Implementations of several types of Discrete Sin/Cosine Transforms with various reductions to FFT.
 
-if __name__ == '__main__':
-    import sys
-    import pathlib
-    p = pathlib.Path().absolute()
-    print("Adding path: ", p)
-    sys.path.append(str(p))
+Currently not used by S4
+"""
 
 import torch
 import torch.nn as nn
@@ -27,7 +23,7 @@ class DCT(nn.Module):
         self.register_buffer('P', P)
 
         # TODO take care of normalization
-        Q = np.exp(-1j * np.pi / (2 * self.N) * np.arange(self.N)) 
+        Q = np.exp(-1j * np.pi / (2 * self.N) * np.arange(self.N))
         Q = torch.tensor(Q, dtype=torch.cfloat)
         self.register_buffer('Q', Q) # half shift
 
@@ -198,61 +194,3 @@ def test_dct_iii():
     for fn in methods:
         y_ = fn(x)
         print("err", torch.norm(y-y_))
-
-def benchmark_dct():
-    T = 100
-    B = 4 * 512
-    N = 512
-    dct2 = DCT(N)
-    dct3 = IDCT(N)
-    x = torch.randn(B, N) + 1j * torch.randn(B, N)
-    dct2 = dct2.to(device)
-    dct3 = dct3.to(device)
-    x = x.to(device)
-
-    methods = [
-        ("DCT-II dense", dct2.forward_dense),
-        ("DCT-II 4N", dct2.forward_4n),
-        ("DCT-II 2N", dct2.forward_2n),
-        ("DCT-II N", dct2.forward_n),
-
-        ("DCT-II dense", dct3.forward_dense),
-        ("DCT-II 4N", dct3.forward_4n),
-        ("DCT-II 2N", dct3.forward_2n),
-    ]
-    for name, fn in methods:
-        utils.benchmark_forward(T, fn, x, desc=name)
-
-"""
-Benchmarking results:
-Complex (Dense / 4N / 2N / N)
-
-CPU (2 threads):
-    B, N = 1, 64    :  30 /  50 / 36 /  86  us
-    B, N = 1, 256   :  84 / 105 / 99 / 137 us
-    B, N = 1, 1024  : 311 / 129 / 64 / 106 us
-
-T4:
-    B, N = 1, 256     :   230 /  203 /  241 /  5090 us
-    B, N = 1*256, 256 :   163 /  150 /  241 /  7210 us
-    B, N = 4*256, 256 :   285 /  526 /  319 /  5000 us
-    B, N = 1, 512     :    55 /   87 /   60 /  4630 us
-    B, N = 1*512, 512 :   424 /  730 /  140 /  5060 us
-    B, N = 4*512, 512 :  1220 / 2020 /  743 /  7240 us
-    B, N = 1, 1024    :   211 /  105 /   55 /  1900 us
-    B, N = 4096, 1024 : 10410 / 8690 / 2870 / 10540 us
-
-    DCT-III
-    B, N = 4*512, 512 :  1.49 /  5.01 / 4.17 ms
-    B, N = 4096, 1024 : 12.02 / 11.32 / 8.18 ms
-"""
-
-if __name__ == '__main__':
-    from benchmark import utils
-
-    device = 'cuda' # 'cpu'
-    device = torch.device(device)
-
-    test_dct_ii()
-    test_dct_iii()
-    # benchmark_dct()

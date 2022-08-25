@@ -12,13 +12,9 @@ from omegaconf import DictConfig
 from einops import rearrange, repeat, reduce
 from opt_einsum import contract
 
-from src.models.sequence.ss.s4 import StateSpace
-from src.models.nn.components import TransposedLN
 from src.models.sequence.base import SequenceModule
 from src.models.sequence.pool import DownPool, UpPool
-from src.models.sequence.ff import FF
 from src.models.sequence.block import SequenceResidualBlock
-
 
 
 class SequenceUNet(SequenceModule):
@@ -38,6 +34,7 @@ class SequenceUNet(SequenceModule):
         initializer=None,
         l_max=-1,
         transposed=True,
+        act_pool=None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -70,6 +67,7 @@ class SequenceUNet(SequenceModule):
                 i, # temporary placeholder for i_layer
                 prenorm=prenorm,
                 dropout=dropres,
+                transposed=self.transposed,
                 layer=layer,
                 residual=residual if residual is not None else 'R',
                 norm=norm,
@@ -84,7 +82,7 @@ class SequenceUNet(SequenceModule):
                 if ff > 0: d_layers.append(_residual(H, i+1, ff_cfg))
 
             # Add sequence downsampling and feature expanding
-            d_layers.append(DownPool(H, H*expand, pool=p, transposed=self.transposed)) # TODO take expansion argument instead
+            d_layers.append(DownPool(H, H*expand, stride=p, transposed=self.transposed, activation=act_pool))
             L //= p
             layer_cfg['l_max'] = L
             H *= expand
@@ -103,7 +101,7 @@ class SequenceUNet(SequenceModule):
             H //= expand
             L *= p
             layer_cfg['l_max'] = L
-            u_layers.append(UpPool(H*expand, H, pool=p, transposed=self.transposed)) # TODO
+            u_layers.append(UpPool(H*expand, H, stride=p, transposed=self.transposed, activation=act_pool))
 
             for i in range(n_layers):
                 u_layers.append(_residual(H, i+1, layer_cfg))
@@ -114,14 +112,11 @@ class SequenceUNet(SequenceModule):
 
         self.norm = nn.LayerNorm(H)
 
-    # @property
-    # def transposed(self):
-    #     return len(self.d_layers) > 0 and self.d_layers[0].transposed
     @property
     def d_output(self):
         return self.d_model
 
-    def forward(self, x, state=None):
+    def forward(self, x, state=None, **kwargs):
         """
         input: (batch, length, d_input)
         output: (batch, length, d_output)
@@ -155,7 +150,7 @@ class SequenceUNet(SequenceModule):
         layers = list(self.d_layers) + list(self.c_layers) + list(self.u_layers)
         return [layer.default_state(*args, **kwargs) for layer in layers]
 
-    def step(self, x, state):
+    def step(self, x, state, **kwargs):
         """
         input: (batch, d_input)
         output: (batch, d_output)
@@ -168,7 +163,7 @@ class SequenceUNet(SequenceModule):
         next_state = []
         for layer in self.d_layers:
             outputs.append(x)
-            x, _next_state = layer.step(x, state=state.pop())
+            x, _next_state = layer.step(x, state=state.pop(), **kwargs)
             next_state.append(_next_state)
             if x is None: break
 
@@ -182,13 +177,13 @@ class SequenceUNet(SequenceModule):
         else:
             outputs.append(x)
             for layer in self.c_layers:
-                x, _next_state = layer.step(x, state=state.pop())
+                x, _next_state = layer.step(x, state=state.pop(), **kwargs)
                 next_state.append(_next_state)
             x = x + outputs.pop()
             u_layers = self.u_layers
 
         for layer in u_layers:
-            x, _next_state = layer.step(x, state=state.pop())
+            x, _next_state = layer.step(x, state=state.pop(), **kwargs)
             next_state.append(_next_state)
             x = x + outputs.pop()
 
@@ -202,143 +197,3 @@ class SequenceUNet(SequenceModule):
         for layer in modules:
             if hasattr(layer, 'cache_all'): layer.cache_all()
 
-def prepare_generation(model):
-    model.eval()
-    if hasattr(model, 'cache_all'): model.cache_all()
-
-@torch.inference_mode()
-def generate_recurrent(model, batch_size=None, x=None):
-    from src.tasks.mixture import mixture_sample
-# TODO incorporate normalization function for dataset
-# TODO handle or document non-mixture case
-    """ generate remaining L-L' samples given x: (B, L', C) a context for the model """
-
-    if x is None:
-        assert batch_size is not None
-        x = torch.zeros(batch_size, model.d_model, device=device)
-        state = model.default_state(batch_size, device=device)
-    else: raise NotImplementedError("Conditional generation not implemented yet")
-
-    xs = []
-    for i in range(model.L):
-        print("pixel", i)
-        x, state = model.step(x, state)
-        x = mixture_sample(x)
-        # TODO postprocess: clamp, divide into buckets, renormalize
-        x = x.unsqueeze(-1)
-        xs.append(x)
-    sample = torch.stack(xs, dim=1)
-    print("recurrent sample shape", sample.shape)
-
-@torch.no_grad()
-def generate_global(model, batch_size=None, x=None, length=None):
-    from tasks.mixture import mixture_sample
-    """ generate remaining L-L' samples given x: (B, L', C) a context for the model """
-
-    if x is None:
-        assert batch_size is not None
-        x = torch.zeros(batch_size, model.L, model.d_input, device=device)
-    else: raise NotImplementedError("Conditional generation not implemented yet")
-
-    if length is None: length = model.L
-    for i in range(length):
-        print("pixel", i)
-        y = model(x)
-        y = torch.cat([y, y.new_zeros(batch_size, 1, model.d_output)], dim=1) # TODO handle sequence shape properly
-        z = mixture_sample(y[:, i, :])
-        # TODO postprocess: clamp, divide into buckets, renormalize
-        z = z.unsqueeze(-1)
-        x[:, i, :] = z
-    print("global sample shape", x.shape)
-
-@torch.inference_mode()
-def test():
-    import time
-    B = 256 # 384
-    L = 3072
-    # x = torch.ones(B, L, C).to(device)
-
-    H = 192
-    model = SequenceUNet(
-        d_model=H,
-        n_layers=16,
-        l_max=L,
-        pool=[3, 4, 4],
-        expand=2,
-        ff=2,
-        # dropout=0.1,
-        layer={'_name_': 's4'},
-        transposed=True,
-    )
-    # print(model)
-
-    # Setup the model
-    model.to(device)
-    for module in model.modules():
-        if hasattr(module, 'setup'): module.setup()
-
-    # Parallelized forward pass
-    # print("input shape", x.shape)
-    # x = torch.ones(B, L, H).to(device)
-    # y, _ = model(x)
-    # print("output shape", y.shape)
-
-
-    # Test stepping
-    model.eval()
-    for module in model.modules():
-        if hasattr(module, 'setup_step'): module.setup_step()
-    state = model.default_state(B, device=device)
-    t = time.time()
-    # for i, _x in enumerate(torch.unbind(x, dim=-2)):
-    _x = torch.zeros(B, H).to(device)
-    for i in range(L):
-        print(i)
-        _y, state = model.step(_x, state)
-        # print("step output", _y, _y.shape)
-        # print("step diff", _y - y[:,i,:])
-    print("time", time.time() - t)
-
-    # Test generation TODO [21-09-25] needs to be hooked up to encoder/decoder
-    # generate_recurrent(model, batch_size=4)
-    # generate_global(model, batch_size=4)
-
-def benchmark():
-    import time
-    L = 3072
-    C = 1
-
-    H = 64
-    k = 12
-    layer = default_cfgs['s4']
-    layer.d_model = 64
-    net = SequenceUNet(
-        d_input=C,
-        d_output=3*k,
-        d_model=H,
-        n_layers=2,
-        l_max=L,
-        pool=[3, 4, 4],
-        expand=2,
-        ff=2,
-        dropout=0.0,
-        layer=layer,
-    )
-    net.to(device)
-    for module in net.modules():
-        if hasattr(module, 'setup'): module.setup()
-    prepare_generation(net)
-
-    t = time.time()
-    # generate_recurrent(net, 8000)
-    generate_global(net, 800, length=64)
-    print("time", time.time() - t)
-    # Utils uses extra memory
-    # from benchmark import utils
-    # utils.benchmark_forward(1, generate_recurrent, net, 8192, desc='Recurrent generation')
-    # utils.benchmark_forward(1, generate_global, net, 512, desc='Global generation')
-
-if __name__ == '__main__':
-    device = torch.device('cuda')
-    test()
-    # benchmark()
