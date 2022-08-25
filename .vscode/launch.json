@@ -9,7 +9,7 @@
             "type": "python",
             "request": "launch",
             "program": "${file}",
-            "args": ["wandb=null","experiment=s4-lra-squadc"],
+            "args": ["wandb=null","experiment=s4-squadc-w"],
             "console": "integratedTerminal"
         }
     ]

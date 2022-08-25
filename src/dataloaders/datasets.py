@@ -761,12 +761,15 @@ class SQUADC(SequenceDataset):
         #tokenize = lambda example: {"tokens": tokenizer(example["text"])[:l_max]}
 
         def tokenize(example):
+            #todo: discard clipped examples, tem que jogar fora, coloca flag pra apagar depois caso o tamanho do exemplo seja maior q l_max
             label=0
             if 'answers' in example:
                 if len(example['answers']['text']) > 0:
                     label=1
-            
-            ret_dict = { "tokens": tokenizer('context: ' + example["context"] + '\nquestion: ' + example['question'])[:l_max],
+            tokens = tokenizer('context: ' + example["context"] + '\nquestion: ' + example['question'])
+            if len(tokens)> l_max:
+                print('------------------------EXEMPLO CAPADO------------------------EXEMPLO CAPADO------------------------EXEMPLO CAPADO------------------------EXEMPLO CAPADO\n')
+            ret_dict = { "tokens": tokens[:l_max],
             "label": label}
 
             return(ret_dict)

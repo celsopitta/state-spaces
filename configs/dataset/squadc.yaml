@@ -1,7 +1,8 @@
 _name_: squadc
-l_max: 4096
+#l_max: 4096
 # tokenizer_type: char
-level: char
+l_max: 1024
+level: word
 # This determines the vocab size
 # word level
 #   min_freq=5: vocab ~ 35000
