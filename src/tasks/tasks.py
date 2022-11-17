@@ -314,6 +314,55 @@ class AdaptiveLMTask(BaseTask):
         self.loss = loss
 
 
+class VQGANIndTask(BaseTask):
+    def __init__(
+        self,
+        div_val,
+        cutoffs : List[int],
+        tie_weights : bool,
+        tie_projs : List[bool],
+        init_scale=1.0,
+        bias_scale=0.0,
+        dropemb=0.0,
+        dropsoft=0.0,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        n_tokens = self.dataset.n_tokens
+        d_model = self.model.d_model
+        d_output = self.model.d_output
+
+        encoder = AdaptiveEmbedding(
+            n_tokens,
+            d_model,
+            d_model,
+            cutoffs=cutoffs,
+            div_val=div_val,
+            init_scale=init_scale,
+            dropout=dropemb,
+        )
+
+        if tie_weights:
+            assert d_model == d_output
+            emb_layers = [i.weight for i in encoder.emb_layers]
+        else:
+            emb_layers = None
+
+        # Construct decoder/loss
+        emb_projs = encoder.emb_projs
+        loss = ProjectedAdaptiveLogSoftmax(
+            n_tokens, d_output, d_output,
+            cutoffs, div_val=div_val,
+            tie_projs=tie_projs,
+            out_projs=emb_projs,
+            out_layers_weights=emb_layers,
+            bias_scale=bias_scale,
+            dropout=dropsoft,
+        )
+
+        self.encoder = encoder
+        self.loss = loss
+
 class ImageNetTask(BaseTask):
     """
     Imagenet training uses mixup augmentations, which require a separate loss for train and val,
@@ -342,6 +391,7 @@ registry = {
     'base': BaseTask,
     'lm': LMTask,
     'adaptivelm': AdaptiveLMTask,
+    'vqganind': VQGANIndTask,
     'imagenet': ImageNetTask,
     'forecasting': ForecastingTask,
     'video': VideoTask,

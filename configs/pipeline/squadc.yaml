@@ -15,4 +15,4 @@ encoder: embedding
 decoder:
   _name_: sequence
   mode: last
-  use_lengths: true
+  use_lengths: true 
