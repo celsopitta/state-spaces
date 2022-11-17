@@ -1,4 +1,4 @@
-""" Standalone version of Structured (Sequence) State Space (S4) model. """
+"""Standalone version of Structured (Sequence) State Space (S4) model."""
 
 import logging
 from functools import partial
@@ -381,7 +381,7 @@ def nplr(measure, N, rank=1, dtype=torch.float, diagonalize_precision=True):
     (w - p q^*, B) is unitarily equivalent to the original HiPPO A, B by the matrix V
     i.e. A = V[w - p q^*]V^*, B = V B
     """
-    assert dtype == torch.float or torch.double
+    assert dtype == torch.float or dtype == torch.double
     cdtype = torch.cfloat if dtype == torch.float else torch.cdouble
 
     A, B = transition(measure, N)
@@ -438,7 +438,7 @@ def nplr(measure, N, rank=1, dtype=torch.float, diagonalize_precision=True):
     return w, P, B, V
 
 def dplr(scaling, N, rank=1, H=1, dtype=torch.float, real_scale=1.0, imag_scale=1.0, random_real=False, random_imag=False, normalize=False, diagonal=True, random_B=False):
-    assert dtype == torch.float or torch.double
+    assert dtype == torch.float or dtype == torch.double
     dtype = torch.cfloat if dtype == torch.float else torch.cdouble
 
     pi = torch.tensor(math.pi)
@@ -654,7 +654,7 @@ class SSKernelNPLR(OptimModule):
         assert w.size(-2) == P.size(-2) == B.size(-2) # n_ssm
         assert self.H % w.size(0) == 0
         self.n_ssm = w.size(0)
-        self.broadcast = self.H // w.size(0)  # Each trainable SSM needs to be duplicated this many times
+        self.repeat = self.H // w.size(0)  # Each trainable SSM needs to be duplicated this many times
 
         # Broadcast everything to correct shapes
         C = C.expand(torch.broadcast_shapes(C.shape, (1, self.H, self.N))) # (C, H, N)
@@ -747,10 +747,10 @@ class SSKernelNPLR(OptimModule):
         omega, z = self._omega(discrete_L, dtype=w.dtype, device=w.device, cache=(rate==1.0))
 
         # Broadcast parameters to same hidden features H
-        B = repeat(B, '1 t n -> 1 (v t) n', v=self.broadcast)
-        P = repeat(P, 'r t n -> r (v t) n', v=self.broadcast)
-        Q = repeat(Q, 'r t n -> r (v t) n', v=self.broadcast)
-        w = repeat(w, 't n -> (v t) n', v=self.broadcast)
+        B = repeat(B, '1 t n -> 1 (v t) n', v=self.repeat)
+        P = repeat(P, 'r t n -> r (v t) n', v=self.repeat)
+        Q = repeat(Q, 'r t n -> r (v t) n', v=self.repeat)
+        w = repeat(w, 't n -> (v t) n', v=self.repeat)
 
         # Augment B
         if state is not None:
@@ -840,10 +840,10 @@ class SSKernelNPLR(OptimModule):
         Q = P.conj()
 
         # Repeat w shape properly
-        B = repeat(B, '1 t n -> 1 (v t) n', v=self.broadcast)
-        P = repeat(P, 'r t n -> r (v t) n', v=self.broadcast)
-        Q = repeat(Q, 'r t n -> r (v t) n', v=self.broadcast)
-        w = repeat(w, 't n -> (v t) n', v=self.broadcast)
+        B = repeat(B, '1 t n -> 1 (v t) n', v=self.repeat)
+        P = repeat(P, 'r t n -> r (v t) n', v=self.repeat)
+        Q = repeat(Q, 'r t n -> r (v t) n', v=self.repeat)
+        w = repeat(w, 't n -> (v t) n', v=self.repeat)
 
         # Prepare Linear stepping
         dt = torch.exp(self.log_dt)
@@ -1056,7 +1056,6 @@ class SSKernelDiag(OptimModule):
         else: lr_dict, lr = lr, None
 
         self.register("log_dt", log_dt, lr_dict.get('dt', lr))
-        self.register("A", _c2r(A), lr_dict.get('A', lr))
         self.register("B", _c2r(B), lr_dict.get('B', lr))
         self.register("inv_A_real", self._A_init(A.real), lr_dict.get('A', lr))
         self.register("A_imag", A.imag, lr_dict.get('A', lr))
@@ -1177,6 +1176,9 @@ class SSKernelDiag(OptimModule):
         self.dC = C
         A = self._A() # (H N)
 
+        A = repeat(A, 't n -> (v t) n', v=self.repeat)
+        B = repeat(B, 't n -> (v t) n', v=self.repeat)
+
         # Incorporate dt into A
         dtA = A * dt.unsqueeze(-1)  # (H N)
         if self.disc == 'zoh':
@@ -1271,9 +1273,10 @@ class SSKernel(nn.Module):
 
         # Broadcast C to have H channels
         if deterministic:
-            C = torch.zeros(channels, self.H, self.N, dtype=cdtype)
+            C = torch.zeros(channels, self.n_ssm, self.N, dtype=cdtype)
             C[:, :, :1] = 1.
             C = contract('hmn, chn -> chm', V.conj().transpose(-1, -2), C) # V^* C
+            C = repeat(C, 'c t n -> c (v t) n', v=self.n_ssm // C.size(-2)).clone().contiguous()
         else:
             C = torch.randn(channels, self.H, self.N//2, dtype=cdtype)
 
@@ -1286,7 +1289,6 @@ class SSKernel(nn.Module):
         B = repeat(B, 't n -> (v t) n', v=self.n_ssm // B.size(-2)).clone().contiguous()
         P = repeat(P, 'r t n -> r (v t) n', v=self.n_ssm // P.size(-2)).clone().contiguous()
         w = repeat(w, 't n -> (v t) n', v=self.n_ssm // w.size(-2)).clone().contiguous()
-        C = C.contiguous()
 
         if mode == "nplr":
             self.kernel = SSKernelNPLR(
@@ -1307,7 +1309,7 @@ class SSKernel(nn.Module):
             )
         else: raise NotImplementedError(f"{mode=} is not valid")
 
-    def forward(self, state=None, L=None, rate=None):
+    def forward(self, state=None, L=None, rate=1.0):
         return self.kernel(state=state, L=L, rate=rate)
 
     @torch.no_grad()
